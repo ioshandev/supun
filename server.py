@@ -6,7 +6,7 @@ optional: BOT_TZ (Asia/Colombo), ANTHROPIC_API_KEY, OWNER_IDS (comma separated t
 """
 import os, io, re, json, hmac, hashlib, html, uuid, random, asyncio, logging, time as _t
 from contextlib import asynccontextmanager
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 import httpx, uvicorn
@@ -24,9 +24,13 @@ SB = os.environ.get("SUPABASE_URL", "").rstrip("/")
 KEY = os.environ.get("SUPABASE_KEY", "")
 PUBLIC = os.environ.get("PUBLIC_URL", "").rstrip("/")
 TZ = ZoneInfo(os.environ.get("BOT_TZ", "Asia/Colombo"))
-OWNERS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+OWNER_LIST = [int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",") if x.isdigit()]
+OWNERS = set(OWNER_LIST)
+SHARE = os.environ.get("SHARE_DATA", "0") == "1"   # 1 = all OWNER_IDS accounts use the SAME data (first id is the main one)
+def did(uid): return OWNER_LIST[0] if SHARE and uid in OWNERS else uid
 AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-5-5")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # keep the bot token out of the logs
 log = logging.getLogger("al"); H = ParseMode.HTML
 HC: httpx.AsyncClient = None
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,13 +45,39 @@ async def db_load(uid):
     r.raise_for_status(); return {x["k"]: x["v"] for x in r.json()}
 async def db_put(uid, items):
     if not items: return
-    rows = [{"tg_id": uid, "k": k, "v": v, "updated_at": datetime.utcnow().isoformat() + "Z"} for k, v in items.items()]
+    rows = [{"tg_id": uid, "k": k, "v": v, "updated_at": datetime.now(timezone.utc).isoformat()} for k, v in items.items()]
     r = await HC.post(f"{SB}/rest/v1/app_data", params={"on_conflict": "tg_id,k"}, content=json.dumps(rows),
                       headers=_h({"Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"}))
+    if r.status_code in (401, 403):
+        raise RuntimeError("Supabase refused the save (%s). SUPABASE_KEY must be the service_role / secret key, NOT the anon / publishable key. %s" % (r.status_code, r.text[:200]))
     r.raise_for_status()
 async def db_metas():
     r = await HC.get(f"{SB}/rest/v1/app_data", params={"k": "eq._meta", "select": "tg_id,v"}, headers=_h())
     r.raise_for_status(); return {x["tg_id"]: x["v"] for x in r.json()}
+
+
+# ============================================================ AI provider (Gemini free tier or Anthropic)
+def ai_on(): return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"))
+async def llm(system, msgs):
+    msgs = list(msgs)
+    while msgs and msgs[0]["role"] != "user": msgs.pop(0)
+    gk = os.environ.get("GEMINI_API_KEY")
+    if gk:
+        model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        body = {"contents": [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]} for m in msgs],
+                "generationConfig": {"maxOutputTokens": 2000}}
+        if system: body["systemInstruction"] = {"parts": [{"text": system}]}
+        r = await HC.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", headers={"x-goog-api-key": gk}, json=body, timeout=60)
+        if r.status_code >= 400: raise RuntimeError(f"gemini {r.status_code} {r.text[:300]}")
+        parts = ((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        out = "".join(p.get("text", "") for p in parts)
+        if not out: raise RuntimeError("gemini empty reply: " + r.text[:300])
+        return out
+    r = await HC.post("https://api.anthropic.com/v1/messages", timeout=60,
+                      headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                      json={"model": AI_MODEL, "max_tokens": 1000, "system": system or "You are a helpful study tutor.", "messages": msgs})
+    if r.status_code >= 400: raise RuntimeError(f"anthropic {r.status_code} {r.text[:300]}")
+    return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
 
 # ============================================================ Telegram Mini App auth
 def verify(init: str) -> int:
@@ -58,7 +88,7 @@ def verify(init: str) -> int:
     if _t.time() - int(d.get("auth_date", "0")) > 3 * 86400: raise ValueError("expired")
     uid = int(json.loads(d["user"])["id"])
     if OWNERS and uid not in OWNERS: raise ValueError("not allowed")
-    return uid
+    return did(uid)
 
 # ============================================================ dashboard data (same keys as the web app)
 SK, MK, PK = "ghostAppElite_V3_StandardBlue", "ghostMarks_V3", "ghostUltimateDb_V4"
@@ -284,8 +314,8 @@ def p_dreams(D, arg=None):
     return txt, M(grid([B(("🏆 " if i in w else DR[i][0] + " ") + DR[i][1][:16], callback_data=f"dr:{i}") for i in range(7)], 2) + [home_btn()])
 
 def p_ai(D, arg=None):
-    ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    return ("🤖 <b>Study AI</b>\nJust type any question (Sinhala / Singlish / English)." if ok else "🤖 Study AI is off (set ANTHROPIC_API_KEY)."), M([home_btn()])
+    ok = ai_on()
+    return ("🤖 <b>Study AI</b>\nJust type any question (Sinhala / Singlish / English)." if ok else "🤖 Study AI is off (set GEMINI_API_KEY)."), M([home_btn()])
 
 PAGES = dict(plan=p_plan, ls=p_ls, habits=p_habits, planner=p_planner, study=p_study, mist=p_mist, targets=p_targets, papers=p_papers,
              marks=p_marks, roadmap=p_roadmap, dreams=p_dreams, ai=p_ai)
@@ -295,11 +325,11 @@ async def ctx_data(update):
     u = update.effective_user
     if OWNERS and u.id not in OWNERS:
         await update.effective_message.reply_text("🔒 Private bot."); return None, None
-    return u.id, await db_load(u.id)
+    return did(u.id), await db_load(did(u.id))
 async def meta_get(uid, D=None):
     D = D if D is not None else await db_load(uid); return D.get("_meta") or {}
 async def meta_set(uid, chat, **kw):
-    m = await meta_get(uid); m.update(chat=chat, **kw); await db_put(uid, {"_meta": m}); return m
+    m = await meta_get(uid); m.update(chat=chat, **kw); m["chats"] = sorted(set(m.get("chats", [])) | {chat}); await db_put(uid, {"_meta": m}); return m
 
 async def send_home(chat, bot, D, uid=None):
     img, _, _ = banner(D); m = await meta_get(uid, D) if uid else {}
@@ -398,12 +428,10 @@ async def on_text(update, ctx):
         await r({"log": "පැය ගණන එවන්න, උදා: 1.5 (නැවැත්තුවොත් /cancel)", "task": "Format: නම | දිනය | විෂය  (දිනය: 2026-11-02, tomorrow, +3)", "mark": "Format: නම | අවසාන ලකුණු | වටය | MCQ | SEQ | Essay  (නම + ලකුණු ඇති)", "ls": "Format: weak 2 | text  හෝ  mind 1 | text", "mist": "Format: විෂය | මාතෘකාව | වැරදුණු විදිය | නිවැරදි විදිය"}.get(k, "Try again (/cancel)"))
 
 async def ai_reply(update, ctx, text):
-    if not os.environ.get("ANTHROPIC_API_KEY"): return await update.effective_message.reply_text("Use the buttons 👇 /menu")
-    from anthropic import AsyncAnthropic
+    if not ai_on(): return await update.effective_message.reply_text("Use the buttons 👇 /menu  (AI off: set GEMINI_API_KEY on Railway)")
     await update.effective_chat.send_action("typing"); h = ctx.user_data.setdefault("ai", []); h.append({"role": "user", "content": text}); del h[:-8]
     try:
-        r = await AsyncAnthropic().messages.create(model=AI_MODEL, max_tokens=900, system=AI_SYS, messages=h)
-        ans = "".join(b.text for b in r.content if b.type == "text"); h.append({"role": "assistant", "content": ans}); await update.effective_message.reply_text(ans[:4000])
+        ans = await llm(AI_SYS, h); h.append({"role": "assistant", "content": ans}); await update.effective_message.reply_text(ans[:4000])
     except Exception as e: log.exception(e); await update.effective_message.reply_text("⚠️ AI error")
 
 # ---- focus timer
@@ -412,12 +440,13 @@ async def focus_done(ctx):
     add_study(D, f["s"], round(f["m"] / 60, 2)); t = fl.setdefault(ds(today()), {"n": 0, "m": 0}); t["n"] += 1; t["m"] += f["m"]
     meta = D.get("_meta") or {}; meta.pop("focus", None)
     await db_put(uid, {SK: D[SK], "focus": fl, "_meta": meta})
-    await ctx.bot.send_message(meta.get("chat", uid), f"🎉 Focus done! +{f['m']} min {SUBJ[f['s']]} added to your study log. 5 min break 🧘")
+    await ctx.bot.send_message(f.get("chat") or meta.get("chat", uid), f"🎉 Focus done! +{f['m']} min {SUBJ[f['s']]} added to your study log. 5 min break 🧘")
 
 # ---- callbacks
 async def on_cb(update, ctx):
-    q = update.callback_query; await q.answer(); uid = q.from_user.id
-    if OWNERS and uid not in OWNERS: return
+    q = update.callback_query; await q.answer(); raw = q.from_user.id
+    if OWNERS and raw not in OWNERS: return
+    uid = did(raw)
     D = await db_load(uid); p = q.data.split(":"); c = p[0]; t = ds(today()); app = ctx.application
     async def page(name, **kw):
         if name == "home":
@@ -484,9 +513,9 @@ async def on_cb(update, ctx):
     if c == "fg":
         meta = D.get("_meta") or {}
         if meta.get("focus"): return await q.answer("A timer is already running", show_alert=True)
-        m = int(p[1]); s = ctx.user_data.get("fsub", "Physics"); meta.update(chat=q.message.chat_id, focus=dict(s=s, m=m)); D["_meta"] = meta; await db_put(uid, {"_meta": meta})
+        m = int(p[1]); s = ctx.user_data.get("fsub", "Physics"); meta.update(chat=q.message.chat_id, focus=dict(s=s, m=m, chat=q.message.chat_id)); D["_meta"] = meta; await db_put(uid, {"_meta": meta})
         for j in app.job_queue.get_jobs_by_name(f"f{uid}"): j.schedule_removal()
-        app.job_queue.run_once(focus_done, m * 60, data=(uid, dict(s=s, m=m)), name=f"f{uid}"); return await page("focus")
+        app.job_queue.run_once(focus_done, m * 60, data=(uid, dict(s=s, m=m, chat=q.message.chat_id)), name=f"f{uid}"); return await page("focus")
     if c == "fc":
         meta = D.get("_meta") or {}; meta.pop("focus", None); D["_meta"] = meta; await db_put(uid, {"_meta": meta})
         for j in app.job_queue.get_jobs_by_name(f"f{uid}"): j.schedule_removal()
@@ -502,16 +531,21 @@ def schedule(app, uid, meta):
 async def am_job(ctx):
     uid = ctx.job.data; D = await db_load(uid); meta = D.get("_meta") or {}
     if not meta.get("notif", True) or not meta.get("chat"): return
-    await send_home(meta["chat"], ctx.bot, D, uid)
     due = [x for x in D.get("tasks", []) if not x.get("done") and x.get("d") and dleft(x["d"]) <= 1]
-    if due: await ctx.bot.send_message(meta["chat"], "⚠️ <b>Due soon</b>\n" + "\n".join(f"{'🎓' if is_exam(x['t']) else '📌'} {esc(x['t'])} — {when(x['d'])}" for x in due), parse_mode=H)
+    for ch in (meta.get("chats") or [meta["chat"]]):
+        try:
+            await send_home(ch, ctx.bot, D, uid)
+            if due: await ctx.bot.send_message(ch, "⚠️ <b>Due soon</b>\n" + "\n".join(f"{'🎓' if is_exam(x['t']) else '📌'} {esc(x['t'])} — {when(x['d'])}" for x in due), parse_mode=H)
+        except Exception as e: log.warning("am_job %s: %s", ch, e)
 async def pm_job(ctx):
     uid = ctx.job.data; D = await db_load(uid); meta = D.get("_meta") or {}
     if not meta.get("notif", True) or not meta.get("chat"): return
     t = ds(today()); dn = hlog(D).get(t, []); miss = [h for h in habs(D) if h[0] not in dn]
     msg = f"🌙 <b>Night review</b>\nStudy {study_on(D, today()):.1f}/{float(D.get('goalH', 6)):g}h · Habits {round(day_pct(D, t) * 100)}%\n"
     msg += ("\nStill open:\n" + "\n".join(f"⬜ {esc(h[1])}" for h in miss) + "\n\nFinish before you sleep 🔥") if miss else "\nAll habits done. Streak safe! 🏆"
-    await ctx.bot.send_message(meta["chat"], msg, parse_mode=H, reply_markup=M([[B("✅ Habits", callback_data="go:habits")]]))
+    for ch in (meta.get("chats") or [meta["chat"]]):
+        try: await ctx.bot.send_message(ch, msg, parse_mode=H, reply_markup=M([[B("✅ Habits", callback_data="go:habits")]]))
+        except Exception as e: log.warning("pm_job %s: %s", ch, e)
 
 # ============================================================ web API + app
 @asynccontextmanager
@@ -524,6 +558,8 @@ async def lifespan(api):
     bot.add_handler(CallbackQueryHandler(on_cb)); bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     await bot.initialize(); await bot.start(); await bot.updater.start_polling(drop_pending_updates=True)
     try:
+        try: await db_put(0, {"_ping": 1}); log.info("Supabase write OK")
+        except Exception as e: log.error("SUPABASE WRITE TEST FAILED: %s", e)
         if PUBLIC: await bot.bot.set_chat_menu_button(menu_button=MenuButtonWebApp("📊 Dashboard", WebAppInfo(PUBLIC + "/")))
         for uid, meta in (await db_metas()).items(): schedule(bot, uid, meta or {})
     except Exception as e: log.warning("startup: %s", e)
@@ -555,18 +591,14 @@ async def post_data(request: Request):
 AI_HITS = {}
 @api.post("/api/ai")
 async def ai_api(request: Request):
-    uid = auth(request); key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key: raise HTTPException(503, "AI key not set")
+    uid = auth(request)
+    if not ai_on(): raise HTTPException(503, "AI key not set")
     hits = [t for t in AI_HITS.get(uid, []) if _t.time() - t < 60]
     if len(hits) >= 12: raise HTTPException(429, "rate limit")
     AI_HITS[uid] = hits + [_t.time()]
     prompt = str((await request.json()).get("prompt", ""))[:8000]
-    r = await HC.post("https://api.anthropic.com/v1/messages", timeout=60,
-                      headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                      json={"model": AI_MODEL, "max_tokens": 1000, "messages": [{"role": "user", "content": prompt}]})
-    if r.status_code >= 400:
-        log.warning("AI error %s %s", r.status_code, r.text[:200]); raise HTTPException(502, "ai error")
-    return {"text": "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")}
+    try: return {"text": await llm("", [{"role": "user", "content": prompt}])}
+    except Exception as e: log.warning("AI error: %s", e); raise HTTPException(502, "ai error")
 
 if __name__ == "__main__":
     for n, v in dict(BOT_TOKEN=TOKEN, SUPABASE_URL=SB, SUPABASE_KEY=KEY).items():
