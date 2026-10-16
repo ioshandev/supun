@@ -2,7 +2,7 @@
 """A/L Dashboard cloud: one process = web dashboard (Telegram Mini App) + Telegram bot.
 Storage: Supabase (table app_data). Hosting: Railway.
 ENV: BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY (service_role), PUBLIC_URL (https://xxx.up.railway.app)
-optional: BOT_TZ (Asia/Colombo), ANTHROPIC_API_KEY, OWNER_IDS (comma separated telegram ids), PORT
+optional: BOT_TZ (Asia/Colombo), GEMINI_API_KEY (FREE AI, aistudio.google.com/app/apikey) or ANTHROPIC_API_KEY (paid), OWNER_IDS (comma separated telegram ids), PORT
 """
 import os, io, re, json, hmac, hashlib, html, uuid, random, asyncio, logging, time as _t
 from contextlib import asynccontextmanager
@@ -79,6 +79,36 @@ QUOTES = ["Discipline is choosing between what you want now and what you want mo
           "I never give up.", "Own every single day.", "දිනලා විතරක් ඉවර කරන්න.", "Small steps every day beat big plans never started."]
 AI_SYS = ("You are a friendly study coach and tutor for a Sri Lankan A/L student (Combined Maths, Physics, Chemistry, plus Python/AI). "
           "ALWAYS reply in Sinhala (technical terms may stay in English). Be concise, explain step by step, encourage discipline.")
+
+# ============================================================ AI (free: Google Gemini  |  paid fallback: Claude)
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODELS = [m for m in (os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite"), "gemini-flash-latest") if m]
+class AIError(Exception):
+    def __init__(self, code, msg=""): super().__init__(msg); self.code = code
+def ai_ready(): return bool(GEMINI_KEY or os.environ.get("ANTHROPIC_API_KEY"))
+async def ai_ask(messages, system=None, max_tokens=1000):
+    """messages = [{'role': 'user'|'assistant', 'content': str}, ...] -> answer text"""
+    system = system or AI_SYS
+    while messages and messages[0]["role"] != "user": messages = messages[1:]
+    if GEMINI_KEY:
+        body = {"systemInstruction": {"parts": [{"text": system}]}, "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.6},
+                "contents": [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]} for m in messages]}
+        for model in GEMINI_MODELS:
+            r = await HC.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", timeout=60, json=body,
+                              headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"})
+            if r.status_code == 404: continue            # model name retired -> try the next one
+            if r.status_code >= 400: raise AIError(r.status_code, r.text[:300])
+            parts = ((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            txt = "".join(p.get("text", "") for p in parts).strip()
+            if txt: return txt
+            raise AIError(502, "empty answer")
+        raise AIError(404, "no Gemini model found - set GEMINI_MODEL")
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key: raise AIError(503, "no AI key")
+    r = await HC.post("https://api.anthropic.com/v1/messages", timeout=60, headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                      json={"model": AI_MODEL, "max_tokens": max_tokens, "system": system, "messages": messages})
+    if r.status_code >= 400: raise AIError(r.status_code, r.text[:300])
+    return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
 
 def now(): return datetime.now(TZ)
 def today(): return now().date()
@@ -289,8 +319,8 @@ def p_dreams(D, arg=None):
     return txt, M(grid([B(("🏆 " if i in w else DR[i][0] + " ") + DR[i][1][:16], callback_data=f"dr:{i}") for i in range(7)], 2) + [home_btn()])
 
 def p_ai(D, arg=None):
-    ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    return ("🤖 <b>Study AI</b>\nJust type any question (Sinhala / Singlish / English)." if ok else "🤖 Study AI is off (set ANTHROPIC_API_KEY)."), M([home_btn()])
+    ok = ai_ready()
+    return ("🤖 <b>Study AI</b>\nJust type any question (Sinhala / Singlish / English)." if ok else "🤖 Study AI is off (set GEMINI_API_KEY - it is free)."), M([home_btn()])
 
 PAGES = dict(plan=p_plan, ls=p_ls, habits=p_habits, planner=p_planner, study=p_study, mist=p_mist, targets=p_targets, papers=p_papers,
              marks=p_marks, roadmap=p_roadmap, dreams=p_dreams, ai=p_ai)
@@ -403,13 +433,14 @@ async def on_text(update, ctx):
         await r({"log": "පැය ගණන එවන්න, උදා: 1.5 (නැවැත්තුවොත් /cancel)", "task": "Format: නම | දිනය | විෂය  (දිනය: 2026-11-02, tomorrow, +3)", "mark": "Format: නම | අවසාන ලකුණු | වටය | MCQ | SEQ | Essay  (නම + ලකුණු ඇති)", "ls": "Format: weak 2 | text  හෝ  mind 1 | text", "mist": "Format: විෂය | මාතෘකාව | වැරදුණු විදිය | නිවැරදි විදිය"}.get(k, "Try again (/cancel)"))
 
 async def ai_reply(update, ctx, text):
-    if not os.environ.get("ANTHROPIC_API_KEY"): return await update.effective_message.reply_text("Use the buttons 👇 /menu")
-    from anthropic import AsyncAnthropic
+    if not ai_ready(): return await update.effective_message.reply_text("Use the buttons 👇 /menu")
     await update.effective_chat.send_action("typing"); h = ctx.user_data.setdefault("ai", []); h.append({"role": "user", "content": text}); del h[:-8]
     try:
-        r = await AsyncAnthropic().messages.create(model=AI_MODEL, max_tokens=900, system=AI_SYS, messages=h)
-        ans = "".join(b.text for b in r.content if b.type == "text"); h.append({"role": "assistant", "content": ans}); await update.effective_message.reply_text(ans[:4000])
-    except Exception as e: log.exception(e); await update.effective_message.reply_text("⚠️ AI error")
+        ans = await ai_ask(h); h.append({"role": "assistant", "content": ans}); await update.effective_message.reply_text(ans[:4000])
+    except AIError as e:
+        log.warning("AI error %s %s", e.code, e); h.pop()
+        await update.effective_message.reply_text("⏳ AI free limit ළඟා වුණා. තත්පර 30ක් ඉඳලා ආයෙත් අහන්න." if e.code == 429 else "⚠️ AI error (GEMINI_API_KEY එක හරිද බලන්න)")
+    except Exception as e: log.exception(e); h.pop(); await update.effective_message.reply_text("⚠️ AI error")
 
 # ---- focus timer
 async def focus_done(ctx):
@@ -550,8 +581,14 @@ def auth(request: Request) -> int:
     if WEB_UID and len(WEB_KEY) >= 16 and hmac.compare_digest(wk.encode(), WEB_KEY.encode()): return WEB_UID
     raise HTTPException(401, "unauthorized")
 
+def index_path():
+    """index.html may be in a 'static' folder OR right next to server.py - both work."""
+    for p in (os.path.join(HERE, "static", "index.html"), os.path.join(HERE, "index.html")):
+        if os.path.exists(p): return p
+    raise HTTPException(404, "index.html not found next to server.py")
+
 @api.get("/")
-async def index(): return FileResponse(os.path.join(HERE, "static", "index.html"), headers={"Cache-Control": "no-store"})
+async def index(): return FileResponse(index_path(), headers={"Cache-Control": "no-store"})
 @api.get("/health")
 async def health(): return {"ok": True}
 @api.get("/api/data")
@@ -568,18 +605,15 @@ async def post_data(request: Request):
 AI_HITS = {}
 @api.post("/api/ai")
 async def ai_api(request: Request):
-    uid = auth(request); key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key: raise HTTPException(503, "AI key not set")
+    uid = auth(request)
+    if not ai_ready(): raise HTTPException(503, "AI key not set")
     hits = [t for t in AI_HITS.get(uid, []) if _t.time() - t < 60]
     if len(hits) >= 12: raise HTTPException(429, "rate limit")
     AI_HITS[uid] = hits + [_t.time()]
     prompt = str((await request.json()).get("prompt", ""))[:8000]
-    r = await HC.post("https://api.anthropic.com/v1/messages", timeout=60,
-                      headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                      json={"model": AI_MODEL, "max_tokens": 1000, "messages": [{"role": "user", "content": prompt}]})
-    if r.status_code >= 400:
-        log.warning("AI error %s %s", r.status_code, r.text[:200]); raise HTTPException(502, "ai error")
-    return {"text": "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")}
+    try: return {"text": await ai_ask([{"role": "user", "content": prompt}])}
+    except AIError as e:
+        log.warning("AI error %s %s", e.code, e); raise HTTPException(429 if e.code == 429 else 502, "ai error")
 
 if __name__ == "__main__":
     for n, v in dict(BOT_TOKEN=TOKEN, SUPABASE_URL=SB, SUPABASE_KEY=KEY).items():
