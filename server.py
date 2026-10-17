@@ -2,7 +2,7 @@
 """A/L Dashboard cloud: one process = web dashboard (Telegram Mini App) + Telegram bot.
 Storage: Supabase (table app_data). Hosting: Railway.
 ENV: BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY (service_role), PUBLIC_URL (https://xxx.up.railway.app)
-optional: BOT_TZ (Asia/Colombo), ANTHROPIC_API_KEY, OWNER_IDS (comma separated telegram ids), PORT
+optional: BOT_TZ (Asia/Colombo), GEMINI_API_KEY (+GEMINI_MODEL) or ANTHROPIC_API_KEY, OWNER_IDS (comma separated telegram ids), PORT
 """
 import os, io, re, json, hmac, hashlib, html, uuid, random, asyncio, logging, base64, math, time as _t
 from contextlib import asynccontextmanager
@@ -418,8 +418,7 @@ def quiz_prompt(k):
             "After I reply, tell me if I'm right and explain briefly.")
 
 def p_ai(D, arg=None):
-    ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    if not ok: return "🤖 Study AI is off (Railway Variables වල <code>ANTHROPIC_API_KEY</code> දාන්න).", M([home_btn()])
+    if not ai_on(): return "🤖 Study AI is off (Railway Variables වල <code>GEMINI_API_KEY</code> දාන්න).", M([home_btn()])
     kb = grid([B("🧪 " + SUBJ[k] + " quiz", callback_data=f"aq:{k}") for k in STUDY], 2) + [[B("💪 Motivate me", callback_data="am")], home_btn()]
     return ("🤖 <b>Study AI</b>\nමොකක් හරි ටයිප් කරන්න (Sinhala / Singlish / English) — AI තනිවම උත්තර දෙයි.\n"
             "📷 ප්‍රශ්නයක photo එකක් එවන්නත් පුළුවන්, step by step විසඳනවා.\n🧪 Quiz එකක් ඕන නම් පහළින් තෝරන්න 👇"), M(kb)
@@ -642,6 +641,28 @@ async def on_text(update, ctx):
         ctx.user_data["await"] = st; ctx.user_data["await_ts"] = ts; ctx.user_data["await_fail"] = f_
         await r({"log": "පැය ගණන එවන්න, උදා: 1.5 (නැවැත්තුවොත් /cancel)", "task": "Format: නම | දිනය | විෂය  (දිනය: 2026-11-02, tomorrow, +3)", "mark": "Format: නම | අවසාන ලකුණු | වටය | MCQ | SEQ | Essay  (නම + ලකුණු ඇති)", "ls": "Format: weak 2 | text  හෝ  mind 1 | text", "mist": "Format: විෂය | මාතෘකාව | වැරදුණු විදිය | නිවැරදි විදිය"}.get(k, "Try again (/cancel)"))
 
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+def _gkey(): return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+def ai_on(): return bool(_gkey() or os.environ.get("ANTHROPIC_API_KEY"))
+async def llm(system, msgs, image=None, max_tokens=1200):
+    """msgs = [{"role": "user"|"assistant", "content": str}]; image = base64 jpeg for the LAST user message. Gemini if GEMINI_API_KEY, else Claude."""
+    if _gkey():
+        contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]} for m in msgs]
+        if image: contents[-1]["parts"].append({"inline_data": {"mime_type": "image/jpeg", "data": image}})
+        body = {"contents": contents, "generationConfig": {"maxOutputTokens": max(max_tokens, 3000)}}
+        if system: body["systemInstruction"] = {"parts": [{"text": system}]}
+        r = await HC.post(f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent", timeout=60, json=body,
+                          headers={"x-goog-api-key": _gkey(), "content-type": "application/json"})
+        if r.status_code >= 400: log.warning("Gemini error %s %s", r.status_code, r.text[:300]); r.raise_for_status()
+        c = (r.json().get("candidates") or [{}])[0]
+        return "".join(x.get("text", "") for x in (c.get("content") or {}).get("parts", [])).strip() or "🤐 (පිළිතුරක් ආවේ නැහැ, වෙන විදිහකට අහන්න)"
+    from anthropic import AsyncAnthropic
+    ms = [dict(m) for m in msgs]
+    if image: ms[-1]["content"] = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image}}, {"type": "text", "text": ms[-1]["content"]}]
+    kw = {"system": system} if system else {}
+    r = await AsyncAnthropic().messages.create(model=AI_MODEL, max_tokens=max_tokens, messages=ms, **kw)
+    return "".join(b.text for b in r.content if b.type == "text").strip()
+
 def ai_ctx(D):
     if not D: return ""
     return (f" Student context: {max(0, (exam_dt(D) - now()).days)} days left to A/L, studied {study_on(D, today()):.1f}h today "
@@ -651,16 +672,13 @@ async def ai_chat(ctx, chat, text, D=None, image=None, msg=None):
         for i in range(0, len(t), 4000):
             if msg: await msg.reply_text(t[i:i + 4000])
             else: await ctx.bot.send_message(chat, t[i:i + 4000])
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return await out("🤖 AI එක on කරන්න Railway Variables වල ANTHROPIC_API_KEY දාන්න. (දැනට buttons පාවිච්චි කරන්න 👇 /menu)")
-    from anthropic import AsyncAnthropic
+    if not ai_on():
+        return await out("🤖 AI එක on කරන්න Railway Variables වල GEMINI_API_KEY දාන්න. (දැනට buttons පාවිච්චි කරන්න 👇 /menu)")
     try: await ctx.bot.send_chat_action(chat, "typing")
     except Exception: pass
     h = ctx.user_data.setdefault("ai", [])
-    content = text if not image else [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image}}, {"type": "text", "text": text}]
     try:
-        r = await AsyncAnthropic().messages.create(model=AI_MODEL, max_tokens=1200, system=AI_SYS + ai_ctx(D), messages=h + [{"role": "user", "content": content}])
-        ans = "".join(b.text for b in r.content if b.type == "text").strip() or "…"
+        ans = await llm(AI_SYS + ai_ctx(D), h + [{"role": "user", "content": text}], image=image) or "…"
         h += [{"role": "user", "content": text if not image else f"[photo] {text}"}, {"role": "assistant", "content": ans}]; del h[:-10]
         await out(ans)
     except Exception as e: log.exception(e); await out("⚠️ AI error — ටිකකින් නැවත try කරන්න")
@@ -869,18 +887,14 @@ async def post_data(request: Request):
 AI_HITS = {}
 @api.post("/api/ai")
 async def ai_api(request: Request):
-    uid = auth(request); key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key: raise HTTPException(503, "AI key not set")
+    uid = auth(request)
+    if not ai_on(): raise HTTPException(503, "AI key not set")
     hits = [t for t in AI_HITS.get(uid, []) if _t.time() - t < 60]
     if len(hits) >= 12: raise HTTPException(429, "rate limit")
     AI_HITS[uid] = hits + [_t.time()]
     prompt = str((await request.json()).get("prompt", ""))[:8000]
-    r = await HC.post("https://api.anthropic.com/v1/messages", timeout=60,
-                      headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                      json={"model": AI_MODEL, "max_tokens": 1000, "messages": [{"role": "user", "content": prompt}]})
-    if r.status_code >= 400:
-        log.warning("AI error %s %s", r.status_code, r.text[:200]); raise HTTPException(502, "ai error")
-    return {"text": "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")}
+    try: return {"text": await llm("", [{"role": "user", "content": prompt}], max_tokens=1000)}
+    except Exception as e: log.warning("AI error %s", e); raise HTTPException(502, "ai error")
 
 if __name__ == "__main__":
     for n, v in dict(BOT_TOKEN=TOKEN, SUPABASE_URL=SB, SUPABASE_KEY=KEY).items():
