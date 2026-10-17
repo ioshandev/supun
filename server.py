@@ -237,28 +237,34 @@ def _logo(d):
 def _jpg(im):
     b = io.BytesIO(); im.convert("RGB").save(b, "JPEG", quality=92); b.seek(0); b.name = "omegavx.jpg"; return b
 
-def banner(D):
+def _bg_light(W, Hh):
+    k = ("bgl", W, Hh)
+    if k in _IC: return _IC[k].copy()
+    im = Image.new("RGB", (W, Hh)); dr = ImageDraw.Draw(im)
+    for y in range(Hh):
+        t = y / Hh; dr.line([(0, y), (W, y)], fill=(int(247 - 12 * t), int(244 - 16 * t), int(255 - 4 * t)))
+    im = im.convert("RGBA"); rnd = random.Random(11); ov = Image.new("RGBA", (W, Hh), (0, 0, 0, 0)); od = ImageDraw.Draw(ov)   # very faint circuit doodles
+    for _ in range(int(W * Hh / 11000)):
+        x, y = rnd.randrange(0, W, 20), rnd.randrange(0, Hh, 20); pts = [(x, y)]
+        for _ in range(rnd.randint(2, 3)):
+            if rnd.random() < .5: x += rnd.choice([-1, 1]) * rnd.randrange(40, 160, 20)
+            else: y += rnd.choice([-1, 1]) * rnd.randrange(40, 160, 20)
+            pts.append((x, y))
+        od.line(pts, fill=(139, 92, 246, 26), width=3); e = pts[-1]; od.ellipse((e[0] - 6, e[1] - 6, e[0] + 6, e[1] + 6), outline=(139, 92, 246, 40), width=3)
+    im = Image.alpha_composite(im, ov); _IC[k] = im; return im.copy()
+
+def banner(D):   # minimal white theme (like the Exam Countdown Bot card)
     ex = exam_dt(D); sec = max(0, int((ex - now()).total_seconds())); days = sec // 86400
     vals = [("MONTHS", days // 30), ("WEEKS", days // 7), ("HOURS", sec // 3600 % 24), ("MINS", sec // 60 % 60)]
-    prog = max(0, min(1, 1 - days / 365)); W, Hh = 1000, 860; im = _bg(W, Hh)
-    CX = W // 2
-    im = _rr(im, (110, 130, W - 110, 580), 70, (0, 0, 0, 150), blur=28, shift=(0, 22))            # card shadow
-    im = _rr(im, (110, 130, W - 110, 580), 70, (255, 255, 255, 255))                                # white card
-    dr = ImageDraw.Draw(im); n = str(days); size = 330 if len(n) <= 3 else 250
-    _txt(dr, (CX, 330), n, size, (24, 16, 48)); _txt(dr, (CX, 480), "DAYS LEFT", 50, (120, 113, 140), spacing=6)
-    dr.rounded_rectangle((220, 535, W - 220, 549), 7, fill=(233, 228, 245)); dr.rounded_rectangle((220, 535, 220 + max(14, int((W - 440) * prog)), 549), 7, fill=(139, 92, 246))
-    im = _rr(im, (240, 62, W - 240, 172), 55, (0, 0, 0, 120), blur=14, shift=(0, 8)); im = _rr(im, (240, 62, W - 240, 172), 55, (255, 255, 255, 255))   # brand pill
-    lg = _logo(84); ring = Image.new("RGBA", im.size, (0, 0, 0, 0)); ImageDraw.Draw(ring).ellipse((258, 71, 258 + 92, 71 + 92), fill=(139, 92, 246, 255)); im = Image.alpha_composite(im, ring)
-    im.alpha_composite(lg, (262, 75)); dr = ImageDraw.Draw(im)
-    _txt(dr, (376, 100), BRAND, 46, (24, 16, 48), anchor="lm"); _txt(dr, (378, 142), TAGLINE, 19, (124, 58, 237), anchor="lm", spacing=5)
-    cw, gap = 200, 20; x0 = (W - (4 * cw + 3 * gap)) // 2                                           # 4 glass chips
-    for i, (lab, v) in enumerate(vals):
-        x = x0 + i * (cw + gap); im = _rr(im, (x, 625, x + cw, 745), 28, (255, 255, 255, 30), outline=(196, 140, 255, 190), width=3)
-    dr = ImageDraw.Draw(im)
-    for i, (lab, v) in enumerate(vals):
-        x = x0 + i * (cw + gap) + cw // 2; _txt(dr, (x, 672), str(v), 56, (255, 255, 255)); _txt(dr, (x, 722), lab, 21, (196, 181, 253), spacing=3)
-    _txt(dr, (CX, 790), f"A/L {ex.year}  •  {ex.strftime('%d %b %Y').upper()}", 28, (233, 224, 255))
-    _txt(dr, (CX, 828), f"POWERED BY {BRAND.upper()}", 19, (167, 139, 250), spacing=5)
+    W, Hh = 1000, 860; CX = W // 2; im = _bg_light(W, Hh); card = (110, 200, W - 110, 650)
+    im = _rr(im, card, 64, (90, 60, 160, 70), blur=30, shift=(0, 24)); im = _rr(im, card, 64, (255, 255, 255, 255))
+    dr = ImageDraw.Draw(im); n = str(days); _txt(dr, (CX, 425), n, 310 if len(n) <= 3 else 240, (28, 25, 40)); _txt(dr, (CX, 580), "DAYS LEFT", 34, (130, 126, 150), spacing=6, bold=False)
+    pill = (250, 140, W - 250, 250)
+    im = _rr(im, pill, 55, (90, 60, 160, 60), blur=14, shift=(0, 8)); im = _rr(im, pill, 55, (255, 255, 255, 255), outline=(235, 230, 250, 255), width=2)
+    im.alpha_composite(_logo(84), (270, 153)); dr = ImageDraw.Draw(im)
+    _txt(dr, (386, 180), BRAND, 44, (28, 25, 40), anchor="lm"); _txt(dr, (388, 224), TAGLINE, 18, (124, 58, 237), anchor="lm", spacing=5)
+    _txt(dr, (CX, 735), f"A/L {ex.year}  •  {ex.strftime('%d %b %Y').upper()}", 28, (90, 85, 115), bold=False)
+    _txt(dr, (CX, 783), f"POWERED BY {BRAND.upper()}", 18, (139, 92, 246), spacing=5)
     return _jpg(im), days, vals
 
 def weekly_img(D):
