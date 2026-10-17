@@ -2,9 +2,9 @@
 """A/L Dashboard cloud: one process = web dashboard (Telegram Mini App) + Telegram bot.
 Storage: Supabase (table app_data). Hosting: Railway.
 ENV: BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY (service_role), PUBLIC_URL (https://xxx.up.railway.app)
-optional: BOT_TZ (Asia/Colombo), GEMINI_API_KEY (FREE AI, aistudio.google.com/app/apikey) or ANTHROPIC_API_KEY (paid), OWNER_IDS (comma separated telegram ids), PORT
+optional: BOT_TZ (Asia/Colombo), ANTHROPIC_API_KEY, OWNER_IDS (comma separated telegram ids), PORT
 """
-import os, io, re, json, hmac, hashlib, html, uuid, random, asyncio, logging, time as _t
+import os, io, re, json, hmac, hashlib, html, uuid, random, asyncio, logging, base64, math, time as _t
 from contextlib import asynccontextmanager
 from datetime import datetime, date, time, timedelta
 from urllib.parse import parse_qsl
@@ -12,9 +12,9 @@ from zoneinfo import ZoneInfo
 import httpx, uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from telegram import (Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M, KeyboardButton,
-                      ReplyKeyboardMarkup, WebAppInfo, MenuButtonWebApp)
+                      ReplyKeyboardMarkup, WebAppInfo, MenuButtonWebApp, BotCommand)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters)
@@ -30,6 +30,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("al"); H = ParseMode.HTML
 HC: httpx.AsyncClient = None
 HERE = os.path.dirname(os.path.abspath(__file__))
+ASSETS = os.path.join(HERE, "assets")
+BRAND, TAGLINE = "OmegaVX", "BEYOND LIMITS"
+SIN_DAYS = ["සඳුදා", "අඟහරුවාදා", "බදාදා", "බ්‍රහස්පතින්දා", "සිකුරාදා", "සෙනසුරාදා", "ඉරිදා"]
 DEFSYL = json.load(open(os.path.join(HERE, "defsyl.json"), encoding="utf8"))
 MK_DEF = {"Physics": {"DU Paper": [], "SR Paper": [], "Past Papers": []}, "Chemistry": {"CD Paper": [], "Past Papers": []},
           "Pure": {"RD Paper": [], "Aja Paper": [], "Past Papers": []}, "Applied": {"Aja Paper": [], "RD Paper": [], "Past Papers": []}}
@@ -60,11 +63,6 @@ def verify(init: str) -> int:
     if OWNERS and uid not in OWNERS: raise ValueError("not allowed")
     return uid
 
-# Web mode (GitHub Pages / any browser): a long secret key stands in for Telegram's initData.
-WEB_KEY = os.environ.get("WEB_KEY", "")
-WEB_UID = int(os.environ.get("WEB_USER_ID") or (min(OWNERS) if OWNERS else 0))
-WEB_ORIGINS = [o.strip().rstrip("/") for o in os.environ.get("WEB_ORIGINS", "https://ioshandev.github.io").split(",") if o.strip()]
-
 # ============================================================ dashboard data (same keys as the web app)
 SK, MK, PK = "ghostAppElite_V3_StandardBlue", "ghostMarks_V3", "ghostUltimateDb_V4"
 SUBJ = {"Physics": "Physics", "Chemistry": "Chemistry", "Pure": "Pure Maths", "Applied": "Applied Maths", "General": "General"}
@@ -76,39 +74,15 @@ RM = [("Foundation", "Now"), ("Programming basics", "Next 90 days"), ("Math for 
 DR = [("🥇", "A/L 1st"), ("🎓", "Faculty of CSE"), ("✈️", "Australia"), ("🤖", "AI scientist"), ("⛓️", "Blockchain & investing"),
       ("💰", "Financial freedom"), ("🏠", "Luxury life")]
 QUOTES = ["Discipline is choosing between what you want now and what you want most.", "Dream big, work hard, and stay focused. Success will follow.",
-          "I never give up.", "Own every single day.", "දිනලා විතරක් ඉවර කරන්න.", "Small steps every day beat big plans never started."]
-AI_SYS = ("You are a friendly study coach and tutor for a Sri Lankan A/L student (Combined Maths, Physics, Chemistry, plus Python/AI). "
-          "ALWAYS reply in Sinhala (technical terms may stay in English). Be concise, explain step by step, encourage discipline.")
-
-# ============================================================ AI (free: Google Gemini  |  paid fallback: Claude)
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODELS = [m for m in (os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite"), "gemini-flash-latest") if m]
-class AIError(Exception):
-    def __init__(self, code, msg=""): super().__init__(msg); self.code = code
-def ai_ready(): return bool(GEMINI_KEY or os.environ.get("ANTHROPIC_API_KEY"))
-async def ai_ask(messages, system=None, max_tokens=1000):
-    """messages = [{'role': 'user'|'assistant', 'content': str}, ...] -> answer text"""
-    system = system or AI_SYS
-    while messages and messages[0]["role"] != "user": messages = messages[1:]
-    if GEMINI_KEY:
-        body = {"systemInstruction": {"parts": [{"text": system}]}, "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.6},
-                "contents": [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]} for m in messages]}
-        for model in GEMINI_MODELS:
-            r = await HC.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", timeout=60, json=body,
-                              headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"})
-            if r.status_code == 404: continue            # model name retired -> try the next one
-            if r.status_code >= 400: raise AIError(r.status_code, r.text[:300])
-            parts = ((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            txt = "".join(p.get("text", "") for p in parts).strip()
-            if txt: return txt
-            raise AIError(502, "empty answer")
-        raise AIError(404, "no Gemini model found - set GEMINI_MODEL")
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key: raise AIError(503, "no AI key")
-    r = await HC.post("https://api.anthropic.com/v1/messages", timeout=60, headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                      json={"model": AI_MODEL, "max_tokens": max_tokens, "system": system, "messages": messages})
-    if r.status_code >= 400: raise AIError(r.status_code, r.text[:300])
-    return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
+          "I never give up.", "Own every single day.", "දිනලා විතරක් ඉවර කරන්න.", "Small steps every day beat big plans never started.",
+          "හිතන්න එපා, පටන් ගන්න.", "ඔයාට පුළුවන්. ඒක මතක තියාගන්න.", "අද කරන්නේ නැත්නම් හෙට ඒක තවත් අමාරුයි.",
+          "වෙහෙස එක දවසක්, ජයග්‍රහණය ජීවිත කාලයක්.", "සෑම දිනයක්ම ඔබේ ඉලක්කයට තව එක පියවරක්.",
+          "Don't stop when you're tired. Stop when you're done.", "Be stronger than your excuses.", "Discipline equals freedom.",
+          "Your future self is watching you right now.", "Beyond limits. 🚀"]
+AI_SYS = ("You are OmegaVX Coach, a friendly study coach and tutor for a Sri Lankan A/L student (Combined Maths, Physics, Chemistry, plus Python/AI). "
+          "ALWAYS reply in Sinhala (technical terms may stay in English). Be concise, explain step by step, encourage discipline. "
+          "Reply in plain text for Telegram: no markdown symbols like ** or #, short paragraphs, light emoji use. "
+          "If the student sends a photo of a question, read it carefully and solve it step by step.")
 
 def now(): return datetime.now(TZ)
 def today(): return now().date()
@@ -185,24 +159,125 @@ def skey(s):
 def bar(p, n=10):
     f = max(0, min(n, round(p * n))); return "█" * f + "░" * (n - f)
 
-# ============================================================ countdown banner (picture)
+# ============================================================ extra stats helpers
+def subj_hours(D, d):
+    day = (D.get(SK) or {}).get(f"{d.year}-{d.month - 1}", {}).get(str(d.day), {}); out = {}
+    for kind in ("SelfStudy", "Classes"):
+        for k, h in (day.get(kind) or {}).items():
+            if isinstance(h, (int, float)): out[k] = out.get(k, 0) + h
+    return out
+def total_study(D):
+    tot = 0
+    for mo in (D.get(SK) or {}).values():
+        if not isinstance(mo, dict): continue
+        for day in mo.values():
+            if isinstance(day, dict):
+                for kind in ("SelfStudy", "Classes"):
+                    tot += sum(h for h in (day.get(kind) or {}).values() if isinstance(h, (int, float)))
+    return tot
+def paper_rounds(D):
+    db = pdb(D); return sum(cnt(r) for k in STUDY for r in db[k]["papers"].values())
+def xp_level(D):
+    xp = int(total_study(D) * 10 + int(D.get("bestStreak", 0)) * 20 + paper_rounds(D) * 2 + sum(1 for m in D.get("mist", []) if m.get("r")) * 5)
+    lv = int(math.sqrt(xp / 50)) + 1; lo, hi = 50 * (lv - 1) ** 2, 50 * lv ** 2
+    return xp, lv, (xp - lo) / (hi - lo), hi
+
+# ============================================================ countdown banner (picture) — OmegaVX style
+_FB = set(); _FC = {}; _IC = {}
+def _font(size, bold=True):
+    k = (size, bold)
+    if k in _FC: return _FC[k]
+    cands = [os.path.join(ASSETS, "bold.ttf" if bold else "regular.ttf")] + (
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"] if bold else
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"])
+    f = None
+    for p in cands:
+        try: f = ImageFont.truetype(p, size); break
+        except Exception: pass
+    if f is None: f = ImageFont.load_default(size); _FB.add(k)
+    _FC[k] = f; return f
+def _txt(dr, xy, s, size, fill, anchor="mm", bold=True, spacing=0):
+    f = _font(size, bold); sw = max(1, size // 40) if (size, bold) in _FB and bold else 0
+    if spacing:  # letter-spaced text (centered)
+        w = sum(dr.textlength(c, font=f) + spacing for c in s) - spacing; x = xy[0] - w / 2 if anchor[0] == "m" else xy[0]
+        for c in s: dr.text((x, xy[1]), c, font=f, fill=fill, anchor="l" + anchor[1]); x += dr.textlength(c, font=f) + spacing
+        return
+    dr.text(xy, s, font=f, fill=fill, anchor=anchor, stroke_width=sw, stroke_fill=fill)
+def _rr(im, box, r, fill, outline=None, width=0, blur=0, shift=(0, 0)):
+    ov = Image.new("RGBA", im.size, (0, 0, 0, 0)); b = (box[0] + shift[0], box[1] + shift[1], box[2] + shift[0], box[3] + shift[1])
+    ImageDraw.Draw(ov).rounded_rectangle(b, r, fill=fill, outline=outline, width=width)
+    if blur: ov = ov.filter(ImageFilter.GaussianBlur(blur))
+    return Image.alpha_composite(im, ov)
+def _bg(W, Hh):
+    k = ("bg", W, Hh)
+    if k in _IC: return _IC[k].copy()
+    im = Image.new("RGB", (W, Hh)); dr = ImageDraw.Draw(im)
+    for y in range(Hh):
+        t = y / Hh; dr.line([(0, y), (W, y)], fill=(int(14 + 16 * t), int(8 + 4 * t), int(30 + 30 * t)))
+    glow = Image.new("RGB", (W, Hh), (0, 0, 0)); ImageDraw.Draw(glow).ellipse((W * .05, Hh * .1, W * .95, Hh * .8), fill=(120, 45, 210))
+    im = Image.blend(im, glow.filter(ImageFilter.GaussianBlur(130)), .38).convert("RGBA")
+    rnd = random.Random(7); ov = Image.new("RGBA", (W, Hh), (0, 0, 0, 0)); od = ImageDraw.Draw(ov)   # circuit lines like the logo
+    for _ in range(int(W * Hh / 9000)):
+        x, y = rnd.randrange(0, W, 20), rnd.randrange(0, Hh, 20); pts = [(x, y)]
+        for _ in range(rnd.randint(2, 4)):
+            if rnd.random() < .5: x += rnd.choice([-1, 1]) * rnd.randrange(40, 200, 20)
+            else: y += rnd.choice([-1, 1]) * rnd.randrange(40, 200, 20)
+            pts.append((x, y))
+        od.line(pts, fill=(168, 85, 247, 60), width=3); e = pts[-1]; od.ellipse((e[0] - 6, e[1] - 6, e[0] + 6, e[1] + 6), outline=(196, 140, 255, 110), width=3)
+    im = Image.alpha_composite(im, ov); _IC[k] = im; return im.copy()
+def _logo(d):
+    k = ("logo", d)
+    if k not in _IC:
+        try: lg = Image.open(os.path.join(ASSETS, "omegavx.png")).convert("RGB").crop((200, 150, 440, 390)).resize((d, d), Image.LANCZOS)
+        except Exception:
+            lg = Image.new("RGB", (d, d), (20, 10, 40)); _txt(ImageDraw.Draw(lg), (d // 2, d // 2), "Ω", d // 2, (192, 132, 252))
+        m = Image.new("L", (d * 4, d * 4), 0); ImageDraw.Draw(m).ellipse((0, 0, d * 4 - 1, d * 4 - 1), fill=255); m = m.resize((d, d), Image.LANCZOS)
+        out = Image.new("RGBA", (d, d), (0, 0, 0, 0)); out.paste(lg, (0, 0), m); _IC[k] = out
+    return _IC[k]
+def _jpg(im):
+    b = io.BytesIO(); im.convert("RGB").save(b, "JPEG", quality=92); b.seek(0); b.name = "omegavx.jpg"; return b
+
 def banner(D):
     ex = exam_dt(D); sec = max(0, int((ex - now()).total_seconds())); days = sec // 86400
     vals = [("MONTHS", days // 30), ("WEEKS", days // 7), ("HOURS", sec // 3600 % 24), ("MINS", sec // 60 % 60)]
-    prog = max(0, min(1, 1 - days / 365))
-    W, Hh = 900, 420; im = Image.new("RGB", (W, Hh)); dr = ImageDraw.Draw(im)
-    for y in range(Hh):
-        t = y / Hh; dr.line([(0, y), (W, y)], fill=(int(16 + 34 * t), int(22 + 26 * t), int(54 + 14 * t)))
-    F = lambda s: ImageFont.load_default(size=s)
-    dr.text((40, 28), f"A/L {ex.year} COUNTDOWN", font=F(34), fill=(250, 204, 21))
-    dr.text((40, 80), str(days), font=F(180), fill=(255, 255, 255))
-    dr.text((60 + dr.textlength(str(days), font=F(180)), 190), "DAYS", font=F(56), fill=(148, 163, 184))
+    prog = max(0, min(1, 1 - days / 365)); W, Hh = 1000, 860; im = _bg(W, Hh)
+    CX = W // 2
+    im = _rr(im, (110, 130, W - 110, 580), 70, (0, 0, 0, 150), blur=28, shift=(0, 22))            # card shadow
+    im = _rr(im, (110, 130, W - 110, 580), 70, (255, 255, 255, 255))                                # white card
+    dr = ImageDraw.Draw(im); n = str(days); size = 330 if len(n) <= 3 else 250
+    _txt(dr, (CX, 330), n, size, (24, 16, 48)); _txt(dr, (CX, 480), "DAYS LEFT", 50, (120, 113, 140), spacing=6)
+    dr.rounded_rectangle((220, 535, W - 220, 549), 7, fill=(233, 228, 245)); dr.rounded_rectangle((220, 535, 220 + max(14, int((W - 440) * prog)), 549), 7, fill=(139, 92, 246))
+    im = _rr(im, (240, 62, W - 240, 172), 55, (0, 0, 0, 120), blur=14, shift=(0, 8)); im = _rr(im, (240, 62, W - 240, 172), 55, (255, 255, 255, 255))   # brand pill
+    lg = _logo(84); ring = Image.new("RGBA", im.size, (0, 0, 0, 0)); ImageDraw.Draw(ring).ellipse((258, 71, 258 + 92, 71 + 92), fill=(139, 92, 246, 255)); im = Image.alpha_composite(im, ring)
+    im.alpha_composite(lg, (262, 75)); dr = ImageDraw.Draw(im)
+    _txt(dr, (376, 100), BRAND, 46, (24, 16, 48), anchor="lm"); _txt(dr, (378, 142), TAGLINE, 19, (124, 58, 237), anchor="lm", spacing=5)
+    cw, gap = 200, 20; x0 = (W - (4 * cw + 3 * gap)) // 2                                           # 4 glass chips
     for i, (lab, v) in enumerate(vals):
-        x = 40 + i * 210
-        dr.rounded_rectangle((x, 290, x + 190, 372), 16, fill=(30, 41, 75), outline=(99, 102, 241), width=2)
-        dr.text((x + 95, 316), str(v), font=F(42), fill="white", anchor="mm"); dr.text((x + 95, 355), lab, font=F(18), fill=(148, 163, 184), anchor="mm")
-    dr.rounded_rectangle((40, 394, 860, 406), 6, fill=(40, 50, 80)); dr.rounded_rectangle((40, 394, 40 + max(12, int(820 * prog)), 406), 6, fill=(250, 204, 21))
-    b = io.BytesIO(); im.save(b, "PNG"); b.seek(0); return b, days, vals
+        x = x0 + i * (cw + gap); im = _rr(im, (x, 625, x + cw, 745), 28, (255, 255, 255, 30), outline=(196, 140, 255, 190), width=3)
+    dr = ImageDraw.Draw(im)
+    for i, (lab, v) in enumerate(vals):
+        x = x0 + i * (cw + gap) + cw // 2; _txt(dr, (x, 672), str(v), 56, (255, 255, 255)); _txt(dr, (x, 722), lab, 21, (196, 181, 253), spacing=3)
+    _txt(dr, (CX, 790), f"A/L {ex.year}  •  {ex.strftime('%d %b %Y').upper()}", 28, (233, 224, 255))
+    _txt(dr, (CX, 828), f"POWERED BY {BRAND.upper()}", 19, (167, 139, 250), spacing=5)
+    return _jpg(im), days, vals
+
+def weekly_img(D):
+    W, Hh = 1000, 700; im = _bg(W, Hh); t = today(); goal = float(D.get("goalH", 6)) or 6
+    days = [t - timedelta(i) for i in range(6, -1, -1)]; vals = [study_on(D, d) for d in days]; mx = max(goal, max(vals), 1) * 1.2
+    im = _rr(im, (40, 120, W - 40, Hh - 40), 44, (255, 255, 255, 245)); dr = ImageDraw.Draw(im)
+    lg = _logo(64); im.alpha_composite(lg, (44, 30)); dr = ImageDraw.Draw(im)
+    _txt(dr, (126, 52), "WEEKLY STUDY REPORT", 36, (255, 255, 255), anchor="lm"); _txt(dr, (126, 92), f"{BRAND}  •  total {sum(vals):.1f}h", 22, (196, 181, 253), anchor="lm", bold=False)
+    base, top, x0 = 560, 205, 100; hh = base - top; sl = (W - 200) / 7
+    gy = base - goal / mx * hh
+    for xx in range(x0, W - 100, 24): dr.line([(xx, gy), (xx + 12, gy)], fill=(245, 158, 11), width=3)
+    _txt(dr, (W - 100, gy - 16), f"goal {goal:g}h", 20, (217, 119, 6), anchor="rm")
+    for i, (d, v) in enumerate(zip(days, vals)):
+        cx = x0 + sl * i + sl / 2; bh = max(4, v / mx * hh); col = (124, 58, 237) if v >= goal else (167, 139, 250)
+        dr.rounded_rectangle((cx - 34, base - bh, cx + 34, base), 12, fill=col)
+        _txt(dr, (cx, base - bh - 20), f"{v:.1f}", 24, (40, 30, 70)); _txt(dr, (cx, base + 30), d.strftime("%a"), 24, (110, 100, 140), bold=False)
+        _txt(dr, (cx, base + 58), d.strftime("%m-%d"), 17, (160, 150, 185), bold=False)
+    dr.line([(x0, base), (W - 100, base)], fill=(210, 200, 235), width=3)
+    return _jpg(im)
 
 # ============================================================ pages (text, keyboard)
 def grid(rows, per=3): return [rows[i:i + per] for i in range(0, len(rows), per)]
@@ -212,24 +287,38 @@ def web_kb():
 def menu_kb():
     items = [("✅ පුරුදු", "habits"), ("📅 සැලසුම", "planner"), ("📚 අධ්‍යයන", "study"), ("🧠 වැරදි", "mist"), ("⏱️ Focus", "focus"),
              ("🎯 ඉලක්ක", "targets"), ("📝 Papers", "papers"), ("📈 ලකුණු", "marks"), ("🗓️ දින 90", "plan"), ("🧭 Roadmap", "roadmap"),
-             ("🌠 සිහින", "dreams"), ("💡 දුර්වලතා", "ls"), ("🤖 AI", "ai")]
+             ("🌠 සිහින", "dreams"), ("💡 දුර්වලතා", "ls"),
+             ("📋 අද", "today"), ("📊 Report", "report"), ("🏆 Level", "stats"), ("🔁 Revise", "revise"), ("📒 Notes", "notes"),
+             ("💬 Motivation", "quote"), ("⚙️ Settings", "settings"), ("🤖 AI", "ai")]
     rows = [[B("🌐 Website (Full Dashboard)", web_app=WebAppInfo(PUBLIC + "/"))]] if PUBLIC else []
     return M(rows + grid([B(l, callback_data="go:" + p) for l, p in items]))
+
+# bottom keyboard buttons -> page
+BOTTOM = {"📋 අද": "today", "✅ පුරුදු": "habits", "📚 අධ්‍යයන": "study", "⏱️ Focus": "focus", "📊 Report": "report",
+          "🏆 Level": "stats", "🤖 AI": "ai", "💬 Motivation": "quote"}
 def reply_kb(meta):
     web = KeyboardButton("🧑‍💻 Web APP ✅", web_app=WebAppInfo(PUBLIC + "/")) if PUBLIC else KeyboardButton("🧑‍💻 Web APP ✅")
-    return ReplyKeyboardMarkup([[KeyboardButton("🕐 Count Down 🍀"), web],
-                                [KeyboardButton("🔔 Notifications: ON" if meta.get("notif", True) else "🔕 Notifications: OFF")]], resize_keyboard=True)
+    K = KeyboardButton
+    return ReplyKeyboardMarkup([[K("🕐 Count Down 🍀"), web],
+                                [K("📋 අද"), K("✅ පුරුදු"), K("📚 අධ්‍යයන")],
+                                [K("⏱️ Focus"), K("📊 Report"), K("🏆 Level")],
+                                [K("🤖 AI"), K("💬 Motivation")],
+                                [K("🔔 Notifications: ON" if meta.get("notif", True) else "🔕 Notifications: OFF")]],
+                               resize_keyboard=True, input_field_placeholder="ප්‍රශ්නයක් ටයිප් කරන්න, AI උත්තර දෙයි 🤖")
 
 def home_caption(D):
     n = now(); g = "🌅 Good Morning" if n.hour < 12 else "☀️ Good Afternoon" if n.hour < 17 else "🌙 Good Evening"
-    ex = exam_dt(D); sec = max(0, int((ex - n).total_seconds())); d = sec // 86400; t = ds(today())
-    out = [f"{g} 🌄", "", "<b>Daily Quote 💬</b>", f"<i>{random.choice(QUOTES)}</i>", "",
+    nm = esc((D.get("_meta") or {}).get("name") or ""); g += (f", <b>{nm}</b>" if nm else "") + " 🌄"
+    ex = exam_dt(D); sec = max(0, int((ex - n).total_seconds())); d = sec // 86400; t = ds(today()); pct = round(max(0, min(1, 1 - d / 365)) * 100)
+    out = [g, "", "💬 <b>Daily Quote</b>", f"<i>{esc(random.choice(QUOTES))}</i>", "",
            f"🎓 {ex.year} A/L විභාගයට තව,", f"🔥 මාස <b>{d // 30}</b>", f"📚 සති <b>{d // 7}</b>", f"🔴 දින <b>{d}</b>",
-           f"⏳ පැය <b>{sec // 3600 % 24}</b>", f"⚡ මිනිත්තු <b>{sec // 60 % 60}</b>", "", f"📅 අද Date: {t}", "",
+           f"⏳ පැය <b>{sec // 3600 % 24}</b>", f"⚡ මිනිත්තු <b>{sec // 60 % 60}</b>", "",
+           f"🚀 {bar(pct / 100, 12)} <b>{pct}%</b>", f"📅 අද Date: {t} · {SIN_DAYS[today().weekday()]}", "",
            f"📖 {bar(study_on(D, today()) / (float(D.get('goalH', 6)) or 6), 8)} {study_on(D, today()):.1f}/{float(D.get('goalH', 6)):g}h · ✅ {round(day_pct(D, t) * 100)}% · 🔥 {streak(D)}"]
     op = sorted([x for x in D.get("tasks", []) if not x.get("done")], key=lambda x: x.get("d") or "9")[:3]
     for x in op: out.append(f"{'🎓' if is_exam(x['t']) else '📌'} {esc(x['t'][:30])} · {when(x.get('d'))}")
-    return "\n".join(out)[:1000]
+    out += ["", f"⚡ <i>Powered by {BRAND}</i> 🚀"]
+    return "\n".join(out)
 
 def p_habits(D, arg=None):
     t = ds(today()); dn = set(hlog(D).get(t, [])); hs = habs(D); p = day_pct(D, t)
@@ -318,12 +407,95 @@ def p_dreams(D, arg=None):
     w = D.get("won", []); txt = f"🌠 <b>Dream board</b> {len(w)}/{len(DR)} won\n<i>MIND IT!</i>\n" + "\n".join(f"{e} {t}{' 🏆' if i in w else ''}" for i, (e, t) in enumerate(DR))
     return txt, M(grid([B(("🏆 " if i in w else DR[i][0] + " ") + DR[i][1][:16], callback_data=f"dr:{i}") for i in range(7)], 2) + [home_btn()])
 
+def quiz_prompt(k):
+    return (f"Ask me ONE challenging A/L {SUBJ.get(k, k)} MCQ (Sri Lankan syllabus) with 4 options A-D. Do NOT reveal the answer yet. "
+            "After I reply, tell me if I'm right and explain briefly.")
+
 def p_ai(D, arg=None):
-    ok = ai_ready()
-    return ("🤖 <b>Study AI</b>\nJust type any question (Sinhala / Singlish / English)." if ok else "🤖 Study AI is off (set GEMINI_API_KEY - it is free)."), M([home_btn()])
+    ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if not ok: return "🤖 Study AI is off (Railway Variables වල <code>ANTHROPIC_API_KEY</code> දාන්න).", M([home_btn()])
+    kb = grid([B("🧪 " + SUBJ[k] + " quiz", callback_data=f"aq:{k}") for k in STUDY], 2) + [[B("💪 Motivate me", callback_data="am")], home_btn()]
+    return ("🤖 <b>Study AI</b>\nමොකක් හරි ටයිප් කරන්න (Sinhala / Singlish / English) — AI තනිවම උත්තර දෙයි.\n"
+            "📷 ප්‍රශ්නයක photo එකක් එවන්නත් පුළුවන්, step by step විසඳනවා.\n🧪 Quiz එකක් ඕන නම් පහළින් තෝරන්න 👇"), M(kb)
+
+def p_today(D, arg=None):
+    t = today(); k = ds(t); goal = float(D.get("goalH", 6)) or 6; sh = subj_hours(D, t); tot = study_on(D, t)
+    hs = habs(D); dn = set(hlog(D).get(k, [])); miss = [h for h in hs if h[0] not in dn]; fl = (D.get("focus") or {}).get(k, {"n": 0, "m": 0})
+    txt = f"📋 <b>අද</b> · {k} · {SIN_DAYS[t.weekday()]}\n\n📖 {bar(tot / goal)} <b>{tot:.1f}/{goal:g}h</b>\n"
+    txt += ("  " + " · ".join(f"{SUBJ[s]} {h:.1f}h" for s, h in sh.items() if h) + "\n") if sh else ""
+    txt += f"⏱️ Focus: {fl['n']} sessions · {fl['m']} min\n\n✅ Habits <b>{len(hs) - len(miss)}/{len(hs)}</b> {bar(day_pct(D, k), 8)}\n"
+    txt += "".join(f"⬜ {esc(h[1][:40])}\n" for h in miss[:4])
+    due = sorted([x for x in D.get("tasks", []) if not x.get("done") and x.get("d") and dleft(x["d"]) <= 2], key=lambda x: x["d"])
+    if due: txt += "\n⚠️ <b>Due soon</b>\n" + "\n".join(f"{'🎓' if is_exam(x['t']) else '📌'} {esc(x['t'][:34])} — {when(x['d'])}" for x in due[:4]) + "\n"
+    txt += f"\n🔥 Streak <b>{streak(D)}</b>"
+    return txt, M([[B("✅ Habits", callback_data="go:habits"), B("📚 Log study", callback_data="go:study"), B("⏱️ Focus", callback_data="go:focus")], home_btn()])
+
+def report_text(D):
+    t = today(); days = [t - timedelta(i) for i in range(6, -1, -1)]; vals = [study_on(D, d) for d in days]; goal = float(D.get("goalH", 6)) or 6
+    sub = {}
+    for d in days:
+        for k_, h in subj_hours(D, d).items(): sub[k_] = sub.get(k_, 0) + h
+    bi = max(range(7), key=lambda i: vals[i]); hp = sum(day_pct(D, ds(d)) for d in days) / 7
+    out = [f"📊 <b>Weekly report</b>  {days[0].strftime('%m-%d')} → {days[-1].strftime('%m-%d')}", "",
+           f"⏱️ Total <b>{sum(vals):.1f}h</b> · avg <b>{sum(vals) / 7:.1f}h</b>/day",
+           f"🏅 Best day: {days[bi].strftime('%a')} ({vals[bi]:.1f}h)", f"🎯 Goal hit: <b>{sum(1 for v in vals if v >= goal)}/7</b> days",
+           f"✅ Habits avg: <b>{round(hp * 100)}%</b>"]
+    if sub: out.append("📚 " + " · ".join(f"{SUBJ.get(k_, k_)} {h:.1f}h" for k_, h in sorted(sub.items(), key=lambda x: -x[1])))
+    out += [f"🔥 Streak <b>{streak(D)}</b>", "", f"⚡ <i>{BRAND}</i>"]
+    return "\n".join(out)
+
+def p_stats(D, arg=None):
+    xp, lv, frac, nxt = xp_level(D); th = total_study(D); bs = max(int(D.get("bestStreak", 0)), streak(D)); pr = paper_rounds(D); rs = sum(1 for m in D.get("mist", []) if m.get("r"))
+    bm = best_mark(D)
+    B_ = [("🔥 7-day streak", bs >= 7), ("🔥 30-day streak", bs >= 30), ("⏱️ 50 study hours", th >= 50), ("⏱️ 100 study hours", th >= 100), ("⏱️ 300 study hours", th >= 300),
+          ("📝 25 paper rounds", pr >= 25), ("📝 100 paper rounds", pr >= 100), ("🧠 10 mistakes fixed", rs >= 10), ("🎯 paper mark 75+", bm >= 75), ("🏆 paper mark 90+", bm >= 90)]
+    txt = (f"🏆 <b>Level {lv}</b> · {xp} XP\n{bar(frac, 12)} → {nxt} XP\n\n⏱️ Total study <b>{th:.1f}h</b>\n🔥 Best streak <b>{bs}</b> days\n📝 Paper rounds <b>{pr}</b>\n🧠 Mistakes fixed <b>{rs}</b>\n\n<b>Badges</b>\n"
+           + "\n".join(("✅ " if ok_ else "🔒 ") + n for n, ok_ in B_))
+    return txt, M([home_btn()])
+
+def p_settings(D, arg=None):
+    m = D.get("_meta") or {}; g = float(D.get("goalH", 6)) or 6; n = m.get("notif", True); am = m.get("am", "05:30"); pm = m.get("pm", "21:30")
+    txt = (f"⚙️ <b>Settings</b>\n\n🔔 Notifications: <b>{'ON' if n else 'OFF'}</b>\n🌅 Morning: <b>{am}</b>\n🌙 Night: <b>{pm}</b>\n🎯 Daily goal: <b>{g:g}h</b>\n"
+           f"🎓 Exam: <b>{D.get('exam', '2027-08-02')}</b>  <i>(/exam 2027-08-02)</i>")
+    kb = [[B("🔔 Notifications: " + ("ON ✅" if n else "OFF 🔕"), callback_data="cs:n")],
+          [B(("● " if abs(g - x) < .01 else "🎯 ") + f"{x}h", callback_data=f"cs:g:{x}") for x in (4, 6, 8, 10)],
+          [B(("● " if am == a else "🌅 ") + a, callback_data="cs:a:" + a.replace(":", "")) for a in ("04:30", "05:00", "05:30", "06:00")],
+          [B(("● " if pm == a else "🌙 ") + a, callback_data="cs:p:" + a.replace(":", "")) for a in ("21:00", "21:30", "22:00", "23:00")]]
+    return txt, M(kb + [home_btn()])
+
+def p_quote(D, arg=None):
+    return f"💬 <b>Motivation</b>\n\n<i>{esc(random.choice(QUOTES))}</i>\n\n🔴 විභාගයට තව දින <b>{max(0, (exam_dt(D) - now()).days)}</b>", \
+        M([[B("🔄 තව එකක්", callback_data="go:quote"), B("🤖 AI Motivation", callback_data="am")], home_btn()])
+
+def p_notes(D, arg=None):
+    L = D.get("notes", [])[:8]; txt = f"📒 <b>Notes</b>  {len(D.get('notes', []))} total\n"; kb = []
+    for n in L:
+        txt += f"\n• {esc(n.get('t', '')[:200])} <i>({n.get('d', '')})</i>"; kb.append([B("🗑 " + n.get("t", "")[:26], callback_data=f"nx:{n['id']}")])
+    if not L: txt += "\nNo notes yet. <code>/note ඔයාගේ note එක</code> හෝ පහළ බොත්තම."
+    return txt, M(kb + [[B("➕ Add note", callback_data="na")], home_btn()])
+
+def p_revise(D, arg=None):
+    L = [m for m in D.get("mist", []) if not m.get("r")]
+    if not L: return "🔁 <b>Revise</b>\nRevise කරන්න වැරදි නැහැ 🎉", M([[B("➕ වැරදි එකතු කරන්න", callback_data="ma")], home_btn()])
+    m = random.choice(L)
+    return (f"🔁 <b>Revise</b> ({len(L)} open)\n\n<b>{esc(m['q'])}</b> [{SUBJ.get(m.get('s'), '')}]\n❌ {esc(m.get('w', '-'))}\n\n✅ <tg-spoiler>{esc(m.get('c', '-'))}</tg-spoiler>\n\n"
+            "<i>Spoiler tap කරලා පිළිතුර බලන්න</i>"), M([[B("✔ ඉගෙනගත්තා", callback_data=f"rs:{m['id']}"), B("⏭ ඊළඟ", callback_data="go:revise")], home_btn()])
 
 PAGES = dict(plan=p_plan, ls=p_ls, habits=p_habits, planner=p_planner, study=p_study, mist=p_mist, targets=p_targets, papers=p_papers,
-             marks=p_marks, roadmap=p_roadmap, dreams=p_dreams, ai=p_ai)
+             marks=p_marks, roadmap=p_roadmap, dreams=p_dreams, ai=p_ai, today=p_today, stats=p_stats, settings=p_settings, quote=p_quote,
+             notes=p_notes, revise=p_revise)
+
+def render(name, D, ctx=None):
+    """-> (text, keyboard, image or None). Photo pages: home, report."""
+    if name == "home": return home_caption(D), menu_kb(), banner(D)[0]
+    if name == "report": return report_text(D), M([[B("📋 අද", callback_data="go:today"), B("🏆 Level", callback_data="go:stats")], home_btn()]), weekly_img(D)
+    if name == "focus":
+        tx, kb = p_focus(D, fs=(ctx.user_data.get("fsub", "Physics") if ctx else "Physics"), active=(D.get("_meta") or {}).get("focus")); return tx, kb, None
+    tx, kb = PAGES[name](D); return tx, kb, None
+async def send_page(chat, ctx, D, name):
+    tx, kb, img = render(name, D, ctx)
+    if img: return await ctx.bot.send_photo(chat, img, caption=tx, parse_mode=H, reply_markup=kb)
+    return await ctx.bot.send_message(chat, tx, parse_mode=H, reply_markup=kb)
 
 # ============================================================ bot plumbing
 async def ctx_data(update):
@@ -343,10 +515,12 @@ async def send_home(chat, bot, D, uid=None):
 async def cmd_start(update, ctx):
     uid, D = await ctx_data(update)
     if not uid: return
-    meta = await meta_set(uid, update.effective_chat.id, **({} if D.get("_meta") else dict(am="05:30", pm="21:30", notif=True)))
-    schedule(ctx.application, uid, meta)
-    await update.effective_message.reply_text("👋 Welcome! Your bot and the Web App share the same data — change in one, it updates in the other.",
-                                              reply_markup=reply_kb(meta))
+    meta = await meta_set(uid, update.effective_chat.id, name=(update.effective_user.first_name or "")[:30], **({} if D.get("_meta") else dict(am="05:30", pm="21:30", notif=True)))
+    schedule(ctx.application, uid, meta); D["_meta"] = meta
+    await update.effective_message.reply_text(
+        f"👋 ආයුබෝවන් <b>{esc(update.effective_user.first_name or '')}</b>! <b>{BRAND} Coach</b> වෙත සාදරයෙන් පිළිගන්නවා 🚀\n\n"
+        "🌐 Bot එකයි Web App එකයි එකම data පාවිච්චි කරනවා — එකක වෙනස්කම් අනිත් එකේ auto update වෙනවා.\n"
+        "🤖 පහළින් මොකක් හරි ටයිප් කරන්න, AI තනිවම උත්තර දෙනවා (📷 photo එකකුත් එවන්න පුළුවන්).", parse_mode=H, reply_markup=reply_kb(meta))
     await send_home(update.effective_chat.id, ctx.bot, D, uid)
 async def cmd_menu(update, ctx):
     uid, D = await ctx_data(update)
@@ -378,9 +552,33 @@ async def cmd_log(update, ctx):
         await update.effective_message.reply_text(f"✅ +{h:g}h {SUBJ[s]} · today {study_on(D, today()):.1f}h")
     except Exception: await update.effective_message.reply_text("Usage: /log physics 1.5")
 async def cmd_ai(update, ctx):
-    q = update.effective_message.text.partition(" ")[2]
-    if q: await ai_reply(update, ctx, q)
-async def cmd_cancel(update, ctx): ctx.user_data.pop("await", None); await update.effective_message.reply_text("Cancelled.")
+    uid, D = await ctx_data(update)
+    if not uid: return
+    q = update.effective_message.text.partition(" ")[2].strip()
+    if q: await ai_reply(update, ctx, q, D)
+    else: await send_page(update.effective_chat.id, ctx, D, "ai")
+async def cmd_cancel(update, ctx): ctx.user_data.pop("await", None); await update.effective_message.reply_text("Cancelled ✅")
+def page_cmd(name):
+    async def f(update, ctx):
+        uid, D = await ctx_data(update)
+        if uid: await send_page(update.effective_chat.id, ctx, D, name)
+    return f
+async def cmd_note(update, ctx):
+    uid, D = await ctx_data(update)
+    if not uid: return
+    txt = update.effective_message.text.partition(" ")[2].strip()
+    if txt:
+        D.setdefault("notes", []).insert(0, dict(id=uid8(), t=txt[:500], d=ds(today()))); await db_put(uid, {"notes": D["notes"]})
+    await send_page(update.effective_chat.id, ctx, D, "notes")
+async def cmd_quiz(update, ctx):
+    uid, D = await ctx_data(update)
+    if not uid: return
+    k = skey(ctx.args[0]) if ctx.args else random.choice(STUDY); k = k if k in STUDY else random.choice(STUDY)
+    await ai_reply(update, ctx, quiz_prompt(k), D)
+async def cmd_help(update, ctx):
+    await update.effective_message.reply_text(
+        "📖 <b>Commands</b>\n/menu · /today · /habits · /study · /focus · /report · /level\n/revise · /notes · /note text · /quote · /quiz physics\n"
+        "/log physics 1.5 · /goal 6 · /exam 2027-08-02 · /remind 05:30 21:30 · /settings · /cancel\n\n🤖 Command නැතුව ටයිප් කරන ඕනම දෙයකට AI උත්තර දෙයි.", parse_mode=H)
 
 async def show(q, text, kb):
     m = q.message
@@ -398,12 +596,14 @@ async def on_text(update, ctx):
     uid, D = await ctx_data(update)
     if not uid: return
     text = (update.effective_message.text or "").strip(); chat = update.effective_chat.id
-    if text.startswith("🕐 Count Down"): return await send_home(chat, ctx.bot, D, uid)
+    if text.startswith("🕐 Count Down"): ctx.user_data.pop("await", None); return await send_home(chat, ctx.bot, D, uid)
+    if text in BOTTOM: ctx.user_data.pop("await", None); return await send_page(chat, ctx, D, BOTTOM[text])
     if text.startswith(("🔔 Notifications", "🔕 Notifications")):
         meta = await meta_set(uid, chat, notif=not (D.get("_meta") or {}).get("notif", True))
         return await update.effective_message.reply_text("🔔 Notifications ON" if meta["notif"] else "🔕 Notifications OFF", reply_markup=reply_kb(meta))
-    st = ctx.user_data.pop("await", None)
-    if not st: return await ai_reply(update, ctx, text)
+    st = ctx.user_data.pop("await", None); ts = ctx.user_data.pop("await_ts", 0)
+    if st and _t.time() - ts > 600: st = None          # stale form -> treat as normal chat
+    if not st: return await ai_reply(update, ctx, text, D)
     k = st[0]; r = update.effective_message.reply_text
     try:
         if k == "log":
@@ -425,22 +625,67 @@ async def on_text(update, ctx):
             m_ = re.match(r"(weak|mind)\s*(\d)\s*\|\s*(.*)", text, re.I | re.S); assert m_
             ls = D.get("ls") or {"weak": ["", "", "", ""], "mind": ["I am turning past failure into power.", "", ""]}; i = int(m_.group(2)) - 1; assert 0 <= i < len(ls[m_.group(1).lower()])
             ls[m_.group(1).lower()][i] = m_.group(3).strip(); D["ls"] = ls; await db_put(uid, {"ls": ls}); t, kb = p_ls(D)
+        elif k == "note":
+            D.setdefault("notes", []).insert(0, dict(id=uid8(), t=text[:500], d=ds(today()))); await db_put(uid, {"notes": D["notes"]}); t, kb = p_notes(D)
         elif k == "tgt":
             tg = D.get("tgt") or {"short": [], "long": []}; tg[st[1]].append(dict(id=uid8(), em="🎯", t=text, d="", img="")); D["tgt"] = tg; await db_put(uid, {"tgt": tg}); t, kb = p_targets(D)
         await r(t, reply_markup=kb, parse_mode=H)
     except Exception:
-        ctx.user_data["await"] = st
+        f_ = ctx.user_data.get("await_fail", 0) + 1
+        if f_ >= 3: ctx.user_data.pop("await_fail", None); return await ai_reply(update, ctx, text, D)   # 3 bad tries -> let AI answer instead
+        ctx.user_data["await"] = st; ctx.user_data["await_ts"] = ts; ctx.user_data["await_fail"] = f_
         await r({"log": "පැය ගණන එවන්න, උදා: 1.5 (නැවැත්තුවොත් /cancel)", "task": "Format: නම | දිනය | විෂය  (දිනය: 2026-11-02, tomorrow, +3)", "mark": "Format: නම | අවසාන ලකුණු | වටය | MCQ | SEQ | Essay  (නම + ලකුණු ඇති)", "ls": "Format: weak 2 | text  හෝ  mind 1 | text", "mist": "Format: විෂය | මාතෘකාව | වැරදුණු විදිය | නිවැරදි විදිය"}.get(k, "Try again (/cancel)"))
 
-async def ai_reply(update, ctx, text):
-    if not ai_ready(): return await update.effective_message.reply_text("Use the buttons 👇 /menu")
-    await update.effective_chat.send_action("typing"); h = ctx.user_data.setdefault("ai", []); h.append({"role": "user", "content": text}); del h[:-8]
+def ai_ctx(D):
+    if not D: return ""
+    return (f" Student context: {max(0, (exam_dt(D) - now()).days)} days left to A/L, studied {study_on(D, today()):.1f}h today "
+            f"(goal {float(D.get('goalH', 6)):g}h), habit streak {streak(D)} days.")
+async def ai_chat(ctx, chat, text, D=None, image=None, msg=None):
+    async def out(t):
+        for i in range(0, len(t), 4000):
+            if msg: await msg.reply_text(t[i:i + 4000])
+            else: await ctx.bot.send_message(chat, t[i:i + 4000])
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return await out("🤖 AI එක on කරන්න Railway Variables වල ANTHROPIC_API_KEY දාන්න. (දැනට buttons පාවිච්චි කරන්න 👇 /menu)")
+    from anthropic import AsyncAnthropic
+    try: await ctx.bot.send_chat_action(chat, "typing")
+    except Exception: pass
+    h = ctx.user_data.setdefault("ai", [])
+    content = text if not image else [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image}}, {"type": "text", "text": text}]
     try:
-        ans = await ai_ask(h); h.append({"role": "assistant", "content": ans}); await update.effective_message.reply_text(ans[:4000])
-    except AIError as e:
-        log.warning("AI error %s %s", e.code, e); h.pop()
-        await update.effective_message.reply_text("⏳ AI free limit ළඟා වුණා. තත්පර 30ක් ඉඳලා ආයෙත් අහන්න." if e.code == 429 else "⚠️ AI error (GEMINI_API_KEY එක හරිද බලන්න)")
-    except Exception as e: log.exception(e); h.pop(); await update.effective_message.reply_text("⚠️ AI error")
+        r = await AsyncAnthropic().messages.create(model=AI_MODEL, max_tokens=1200, system=AI_SYS + ai_ctx(D), messages=h + [{"role": "user", "content": content}])
+        ans = "".join(b.text for b in r.content if b.type == "text").strip() or "…"
+        h += [{"role": "user", "content": text if not image else f"[photo] {text}"}, {"role": "assistant", "content": ans}]; del h[:-10]
+        await out(ans)
+    except Exception as e: log.exception(e); await out("⚠️ AI error — ටිකකින් නැවත try කරන්න")
+async def ai_reply(update, ctx, text, D=None): return await ai_chat(ctx, update.effective_chat.id, text, D, msg=update.effective_message)
+async def on_photo(update, ctx):
+    uid, D = await ctx_data(update)
+    if not uid: return
+    m = update.effective_message
+    try:
+        f = await m.photo[-1].get_file(); raw = bytes(await f.download_as_bytearray())
+        await ai_chat(ctx, m.chat_id, m.caption or "මේ ප්‍රශ්නය/පිටුව කියවලා step by step පැහැදිලි කරලා විසඳන්න.", D, image=base64.b64encode(raw).decode(), msg=m)
+    except Exception as e: log.exception(e); await m.reply_text("⚠️ Photo එක කියවන්න බැරි වුණා, නැවත එවන්න.")
+
+# ---- auto reactions (every incoming message / command)
+POS = ["🔥", "\u2764", "👍", "💯", "⚡", "🏆", "🎉", "🤩", "👏", "😎", "🫡"]
+CMD_R = dict(start="🔥", menu="⚡", today="💯", habits="💯", study="\u270d", log="\u270d", focus="🔥", report="🏆", level="🏆", revise="🤓", notes="\u270d", note="\u270d",
+             quote="\u2764", quiz="🤓", ai="🤓", settings="👌", goal="💯", exam="🫡", remind="👍", cancel="👌", help="🤝")
+async def auto_react(update, ctx):
+    m = update.effective_message; u = update.effective_user
+    if not m or not u or (OWNERS and u.id not in OWNERS): return
+    t = (m.text or "").strip()
+    if t.startswith("/"): e = CMD_R.get(t[1:].split()[0].split("@")[0].lower(), random.choice(POS))
+    elif m.photo: e = "👀"
+    elif t.startswith(("🕐", "🔔", "🔕")): e = "🔥"
+    elif t in BOTTOM: e = "⚡"
+    elif re.fullmatch(r"[\d.\s]+(class)?", t.lower()): e = "\u270d"
+    elif re.match(r"((hi|hello|hey)\b|හායි|ආයුබෝවන්)", t.lower()): e = "🤗"
+    elif "?" in t: e = "🤔"
+    else: e = random.choice(POS)
+    try: await m.set_reaction(e)
+    except Exception as ex: log.debug("react: %s", ex)
 
 # ---- focus timer
 async def focus_done(ctx):
@@ -451,21 +696,22 @@ async def focus_done(ctx):
     await ctx.bot.send_message(meta.get("chat", uid), f"🎉 Focus done! +{f['m']} min {SUBJ[f['s']]} added to your study log. 5 min break 🧘")
 
 # ---- callbacks
+TOAST = dict(hb="🔥 Habit updated", tk="✅ Updated", tx="🗑 Deleted", mx="🗑 Deleted", ms="🧠 Updated", rs="💪 නියමයි! ඉගෙනගත්තා", rd="🧭 Updated", dr="🏆 Dream!",
+             pr="📄 ✔", sx="📚 ✔", s90="🚀 අලුත් පටන්ගැන්මක්!", cs="⚙️ Saved ✅", nx="🗑 Deleted", fs="⏱️ Subject set", fc="⏹ Cancelled", aq="🧪 Quiz ready…", am="💪 ඔන්න…")
 async def on_cb(update, ctx):
-    q = update.callback_query; await q.answer(); uid = q.from_user.id
+    q = update.callback_query; uid = q.from_user.id; p = q.data.split(":"); c = p[0]
+    if c != "fg": await q.answer(TOAST.get(c))          # small pop-up reaction on every button (fg answers itself below)
     if OWNERS and uid not in OWNERS: return
-    D = await db_load(uid); p = q.data.split(":"); c = p[0]; t = ds(today()); app = ctx.application
+    D = await db_load(uid); t = ds(today()); app = ctx.application
     async def page(name, **kw):
-        if name == "home":
-            img, _, _ = banner(D)
+        tx, kb, img = render(name, D, ctx)
+        if img:
             try: await q.message.delete()
             except Exception: pass
-            return await q.message.chat.send_photo(img, caption=home_caption(D), parse_mode=H, reply_markup=menu_kb())
-        if name == "focus":
-            meta = D.get("_meta") or {}; tx, kb = p_focus(D, fs=ctx.user_data.get("fsub", "Physics"), active=meta.get("focus"))
-        else: tx, kb = PAGES[name](D)
+            return await q.message.chat.send_photo(img, caption=tx, parse_mode=H, reply_markup=kb)
         await show(q, tx, kb)
-    async def ask(state, prompt): ctx.user_data["await"] = state; await q.message.reply_text(prompt, parse_mode=H)
+    async def ask(state, prompt):
+        ctx.user_data["await"] = state; ctx.user_data["await_ts"] = _t.time(); ctx.user_data.pop("await_fail", None); await q.message.reply_text(prompt, parse_mode=H)
     if c == "go": return await page(p[1])
     if c == "hb":
         d = hlog(D).setdefault(t, []); d.remove(p[1]) if p[1] in d else d.append(p[1])
@@ -520,13 +766,29 @@ async def on_cb(update, ctx):
     if c == "fg":
         meta = D.get("_meta") or {}
         if meta.get("focus"): return await q.answer("A timer is already running", show_alert=True)
-        m = int(p[1]); s = ctx.user_data.get("fsub", "Physics"); meta.update(chat=q.message.chat_id, focus=dict(s=s, m=m)); D["_meta"] = meta; await db_put(uid, {"_meta": meta})
+        await q.answer("⏱️ Focus started 🔥"); m = int(p[1]); s = ctx.user_data.get("fsub", "Physics"); meta.update(chat=q.message.chat_id, focus=dict(s=s, m=m)); D["_meta"] = meta; await db_put(uid, {"_meta": meta})
         for j in app.job_queue.get_jobs_by_name(f"f{uid}"): j.schedule_removal()
         app.job_queue.run_once(focus_done, m * 60, data=(uid, dict(s=s, m=m)), name=f"f{uid}"); return await page("focus")
     if c == "fc":
         meta = D.get("_meta") or {}; meta.pop("focus", None); D["_meta"] = meta; await db_put(uid, {"_meta": meta})
         for j in app.job_queue.get_jobs_by_name(f"f{uid}"): j.schedule_removal()
         return await page("focus")
+
+    if c == "na": return await ask(("note",), "📒 ඔයාගේ note එක එවන්න:")
+    if c == "nx": D["notes"] = [n for n in D.get("notes", []) if n["id"] != p[1]]; await db_put(uid, {"notes": D["notes"]}); return await page("notes")
+    if c == "rs":
+        for m in D.get("mist", []):
+            if m["id"] == p[1]: m["r"] = True
+        await db_put(uid, {"mist": D.get("mist", [])}); return await page("revise")
+    if c == "aq": return await ai_chat(ctx, q.message.chat_id, quiz_prompt(p[1]), D)
+    if c == "am":
+        return await ai_chat(ctx, q.message.chat_id, "මට අද දවසට කෙටි, ශක්තිමත් motivation message එකක් දෙන්න. ඊට පස්සේ අද කරන්න ඕන ප්‍රධාන දේවල් 3ක් කියන්න.", D)
+    if c == "cs":
+        meta = D.get("_meta") or {}; meta["chat"] = q.message.chat_id
+        if p[1] == "n": meta["notif"] = not meta.get("notif", True)
+        elif p[1] == "g": D["goalH"] = float(p[2]); await db_put(uid, {"goalH": D["goalH"]})
+        elif p[1] in ("a", "p"): meta["am" if p[1] == "a" else "pm"] = p[2][:2] + ":" + p[2][2:]
+        D["_meta"] = meta; await db_put(uid, {"_meta": meta}); schedule(app, uid, meta); return await page("settings")
 
 # ---- reminders
 def schedule(app, uid, meta):
@@ -555,11 +817,21 @@ async def lifespan(api):
     global HC
     HC = httpx.AsyncClient(timeout=20)
     bot = Application.builder().token(TOKEN).build()
-    for n, f in dict(start=cmd_start, menu=cmd_menu, exam=cmd_exam, goal=cmd_goal, remind=cmd_remind, log=cmd_log, ai=cmd_ai, cancel=cmd_cancel).items():
+    for n, f in dict(start=cmd_start, menu=cmd_menu, exam=cmd_exam, goal=cmd_goal, remind=cmd_remind, log=cmd_log, ai=cmd_ai, cancel=cmd_cancel,
+                     note=cmd_note, quiz=cmd_quiz, help=cmd_help).items():
         bot.add_handler(CommandHandler(n, f))
-    bot.add_handler(CallbackQueryHandler(on_cb)); bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    for n, pg in dict(today="today", habits="habits", study="study", focus="focus", report="report", level="stats", revise="revise", notes="notes",
+                      quote="quote", settings="settings", planner="planner", papers="papers", marks="marks", mistakes="mist", dreams="dreams").items():
+        bot.add_handler(CommandHandler(n, page_cmd(pg)))
+    bot.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, auto_react, block=False), group=-1)   # react to EVERY message/command
+    bot.add_handler(CallbackQueryHandler(on_cb)); bot.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     await bot.initialize(); await bot.start(); await bot.updater.start_polling(drop_pending_updates=True)
     try:
+        await bot.bot.set_my_commands([BotCommand(c_, d_) for c_, d_ in (
+            ("menu", "🏠 Main menu + countdown"), ("today", "📋 Today summary"), ("habits", "✅ Daily habits"), ("study", "📚 Study log"), ("focus", "⏱️ Focus timer"),
+            ("report", "📊 Weekly report"), ("level", "🏆 Level & badges"), ("revise", "🔁 Revise mistakes"), ("notes", "📒 Notes"), ("quote", "💬 Motivation"),
+            ("quiz", "🧪 AI quiz"), ("ai", "🤖 Ask AI"), ("settings", "⚙️ Settings"), ("help", "📖 All commands"))])
         if PUBLIC: await bot.bot.set_chat_menu_button(menu_button=MenuButtonWebApp("📊 Dashboard", WebAppInfo(PUBLIC + "/")))
         for uid, meta in (await db_metas()).items(): schedule(bot, uid, meta or {})
     except Exception as e: log.warning("startup: %s", e)
@@ -567,28 +839,14 @@ async def lifespan(api):
     await bot.updater.stop(); await bot.stop(); await bot.shutdown(); await HC.aclose()
 
 api = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
-from fastapi.middleware.cors import CORSMiddleware
-api.add_middleware(CORSMiddleware, allow_origins=WEB_ORIGINS, allow_methods=["GET", "POST", "OPTIONS"],
-                   allow_headers=["Content-Type", "X-Init-Data", "X-Web-Key"], max_age=86400)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 def auth(request: Request) -> int:
-    init = request.headers.get("X-Init-Data", "")
-    if init:
-        try: return verify(init)
-        except Exception: raise HTTPException(401, "unauthorized")
-    wk = request.headers.get("X-Web-Key", "")
-    if WEB_UID and len(WEB_KEY) >= 16 and hmac.compare_digest(wk.encode(), WEB_KEY.encode()): return WEB_UID
-    raise HTTPException(401, "unauthorized")
-
-def index_path():
-    """index.html may be in a 'static' folder OR right next to server.py - both work."""
-    for p in (os.path.join(HERE, "static", "index.html"), os.path.join(HERE, "index.html")):
-        if os.path.exists(p): return p
-    raise HTTPException(404, "index.html not found next to server.py")
+    try: return verify(request.headers.get("X-Init-Data", ""))
+    except Exception: raise HTTPException(401, "unauthorized")
 
 @api.get("/")
-async def index(): return FileResponse(index_path(), headers={"Cache-Control": "no-store"})
+async def index(): return FileResponse(os.path.join(HERE, "static", "index.html"), headers={"Cache-Control": "no-store"})
 @api.get("/health")
 async def health(): return {"ok": True}
 @api.get("/api/data")
@@ -605,15 +863,18 @@ async def post_data(request: Request):
 AI_HITS = {}
 @api.post("/api/ai")
 async def ai_api(request: Request):
-    uid = auth(request)
-    if not ai_ready(): raise HTTPException(503, "AI key not set")
+    uid = auth(request); key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key: raise HTTPException(503, "AI key not set")
     hits = [t for t in AI_HITS.get(uid, []) if _t.time() - t < 60]
     if len(hits) >= 12: raise HTTPException(429, "rate limit")
     AI_HITS[uid] = hits + [_t.time()]
     prompt = str((await request.json()).get("prompt", ""))[:8000]
-    try: return {"text": await ai_ask([{"role": "user", "content": prompt}])}
-    except AIError as e:
-        log.warning("AI error %s %s", e.code, e); raise HTTPException(429 if e.code == 429 else 502, "ai error")
+    r = await HC.post("https://api.anthropic.com/v1/messages", timeout=60,
+                      headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                      json={"model": AI_MODEL, "max_tokens": 1000, "messages": [{"role": "user", "content": prompt}]})
+    if r.status_code >= 400:
+        log.warning("AI error %s %s", r.status_code, r.text[:200]); raise HTTPException(502, "ai error")
+    return {"text": "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")}
 
 if __name__ == "__main__":
     for n, v in dict(BOT_TOKEN=TOKEN, SUPABASE_URL=SB, SUPABASE_KEY=KEY).items():
